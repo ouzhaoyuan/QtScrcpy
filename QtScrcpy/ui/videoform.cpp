@@ -43,6 +43,10 @@ VideoForm::VideoForm(bool framelessWindow, bool skin, bool showToolbar, QWidget 
     if (framelessWindow) {
         setWindowFlags(windowFlags() | Qt::FramelessWindowHint);
     }
+    // Ensure phone IME is restored even if app crashes/gets killed
+    connect(qApp, &QApplication::aboutToQuit, this, [this](){
+        restoreOriginalIme();
+    });
 }
 
 VideoForm::~VideoForm()
@@ -608,7 +612,7 @@ void VideoForm::mousePressEvent(QMouseEvent *event)
             qInfo() << posTip.toStdString().c_str();
 
             // Record click position in Android coords for IME cursor positioning
-            if (m_imeSwitched && m_videoWidget->frameSize().isValid()) {
+            if (m_videoWidget->frameSize().isValid()) {
                 QPointF widgetPos = m_videoWidget->mapFrom(this, localPos.toPoint());
                 m_lastClickAndroid.setX(qRound(widgetPos.x() * m_videoWidget->frameSize().width() / m_videoWidget->width()));
                 m_lastClickAndroid.setY(qRound(widgetPos.y() * m_videoWidget->frameSize().height() / m_videoWidget->height()));
@@ -754,12 +758,13 @@ void VideoForm::keyPressEvent(QKeyEvent *event)
         switchFullScreen();
     }
 
-    // If AdbKeyboard is active, inject printable characters via clipboard+paste
-    // This makes PC keyboard input go to the phone reliably (no phone soft keyboard)
-    if (m_imeSwitched && !event->text().isEmpty() && !event->isAutoRepeat()) {
+    // Inject printable characters via clipboard+paste (works regardless of AdbKeyboard)
+    // setClipboardAndPaste uses scrcpy protocol SET_CLIPBOARD + Ctrl+V, which works
+    // with ANY phone IME - no need to switch away from user's normal keyboard.
+    if (!event->text().isEmpty() && !event->isAutoRepeat()) {
         // Only inject for printable characters (letters, numbers, symbols, space)
         // Skip control keys (Ctrl, Alt, Meta combos) - let those go as keyEvent
-        if (!(event->modifiers() & Qt::ControlModifier) && 
+        if (!(event->modifiers() & Qt::ControlModifier) &&
             !(event->modifiers() & Qt::MetaModifier)) {
             QString text = event->text();
             device->setClipboardAndPaste(text);
@@ -816,7 +821,10 @@ bool VideoForm::event(QEvent *event)
     // get eaten by the IME (e.g. Sogou shows emoji panel on Backspace) and
     // never reach keyPressEvent. We must intercept them here and send directly
     // to Android.
-    if (m_imeSwitched && event->type() == QEvent::KeyPress) {
+    // NOTE: Control key interception is always needed when WA_InputMethodEnabled is true,
+    // because Qt routes all key events through the IME pipeline. Without this, Backspace
+    // gets eaten by Sogou IME (shows emoji panel) and never reaches Android.
+    if (event->type() == QEvent::KeyPress) {
         auto keyEvent = static_cast<QKeyEvent*>(event);
         int key = keyEvent->key();
         // List of control keys that should bypass IME and go directly to Android
@@ -864,12 +872,39 @@ void VideoForm::showEvent(QShowEvent *event)
             showToolForm(this->show_toolbar);
         });
     }
-    // Switch to AdbKeyboard after device is shown (delay to ensure serial is set)
-    if (!m_imeSwitched && !m_serial.isEmpty()) {
+    // NOTE: Do NOT auto-switch to AdbKeyboard here!
+    // Previous version auto-switched phone IME to AdbKeyboard, which broke
+    // the phone's soft keyboard if the app crashed/disconnected before restore.
+    // Now we keep the phone's original IME intact. Chinese input from PC
+    // still works via setClipboardAndPaste() (scrcpy protocol, no AdbKeyboard needed).
+    // AdbKeyboard switch is only triggered manually by the user (toolbar button).
+
+    // Instead of switching IME, just hide soft keyboard while scrcpy is connected
+    // by disabling "show IME with hard keyboard" (scrcpy simulates a hard keyboard)
+    if (!m_serial.isEmpty()) {
         QTimer::singleShot(1000, this, [this](){
-            switchToAdbKeyboard();
+            if (m_serial.isEmpty()) return;
+            QString adbPath = QCoreApplication::applicationDirPath() + "/adb";
+            // Save current IME for potential future restore
+            QStringList args;
+            args << "-s" << m_serial << "shell" << "settings" << "get" << "secure" << "default_input_method";
+            QProcess proc;
+            proc.start(adbPath, args);
+            proc.waitForFinished(3000);
+            QString currentIme = QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+            if (!currentIme.isEmpty() && currentIme != "com.android.adbkeyboard/.AdbIME") {
+                m_originalIme = currentIme;
+                qInfo() << "Original IME saved:" << m_originalIme;
+            }
+            // Hide soft keyboard while scrcpy is active (don't switch IME!)
+            args.clear();
+            args << "-s" << m_serial << "shell" << "settings" << "put" << "secure" << "show_ime_with_hard_keyboard" << "0";
+            proc.start(adbPath, args);
+            proc.waitForFinished(3000);
+            qInfo() << "Soft keyboard hidden (IME unchanged):" << m_originalIme;
         });
     }
+
     // Enable Qt input method for Chinese input support
     setAttribute(Qt::WA_InputMethodEnabled, true);
 }
@@ -900,7 +935,7 @@ void VideoForm::resizeEvent(QResizeEvent *event)
     }
 
     // Reposition IME cursor when window resizes (fullscreen, maximize, etc.)
-    if (m_imeSwitched && !m_lastInputBounds.isEmpty()) {
+    if (!m_lastInputBounds.isEmpty()) {
         QPointF topLeft = androidToFormPos(m_lastInputBounds.left(), m_lastInputBounds.top());
         QPointF bottomRight = androidToFormPos(m_lastInputBounds.right(), m_lastInputBounds.bottom());
         m_imeCursorRect = QRectF(topLeft.x(), topLeft.y(), qMax(bottomRight.x() - topLeft.x(), 2.0), qMax(bottomRight.y() - topLeft.y(), 16.0));
@@ -1022,32 +1057,37 @@ void VideoForm::switchToAdbKeyboard()
 
 void VideoForm::restoreOriginalIme()
 {
-    if (!m_imeSwitched || m_serial.isEmpty()) {
+    if (m_serial.isEmpty()) {
         return;
     }
 
     QString adbPath = QCoreApplication::applicationDirPath() + "/adb";
 
-    // Try to restore to Sogou first (user's known IME), then fall back to saved IME
-    QString targetIme = "com.sohu.inputmethod.sogou/.SogouIME";
-    if (!m_originalIme.isEmpty()) {
-        targetIme = m_originalIme;
-    }
-
+    // Always restore "show IME with hard keyboard" so phone soft keyboard works again
     QStringList args;
-    args << "-s" << m_serial << "shell" << "ime" << "set" << targetIme;
+    args << "-s" << m_serial << "shell" << "settings" << "put" << "secure" << "show_ime_with_hard_keyboard" << "1";
     QProcess proc;
     proc.start(adbPath, args);
     proc.waitForFinished(3000);
 
-    // Re-enable "show IME with hard keyboard" for normal use
-    args.clear();
-    args << "-s" << m_serial << "shell" << "settings" << "put" << "secure" << "show_ime_with_hard_keyboard" << "1";
-    proc.start(adbPath, args);
-    proc.waitForFinished(3000);
+    // Only restore IME if we actually switched to AdbKeyboard (manual switch)
+    if (m_imeSwitched) {
+        // Try to restore to Sogou first (user's known IME), then fall back to saved IME
+        QString targetIme = "com.sohu.inputmethod.sogou/.SogouIME";
+        if (!m_originalIme.isEmpty()) {
+            targetIme = m_originalIme;
+        }
 
-    m_imeSwitched = false;
-    qInfo() << "Restored original IME:" << targetIme;
+        args.clear();
+        args << "-s" << m_serial << "shell" << "ime" << "set" << targetIme;
+        proc.start(adbPath, args);
+        proc.waitForFinished(3000);
+
+        m_imeSwitched = false;
+        qInfo() << "Restored original IME:" << targetIme;
+    }
+
+    qInfo() << "Restored show_ime_with_hard_keyboard=1, phone soft keyboard should work again";
 }
 
 QString VideoForm::runAdbCommand(const QString &serial, const QStringList &args)
